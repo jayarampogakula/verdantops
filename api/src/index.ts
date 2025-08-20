@@ -1,22 +1,18 @@
-import "dotenv/config";
 import express from "express";
 import bodyParser from "body-parser";
-import { migrate } from "./db.js";
-import ingest from "./routes/ingest.js";
-import health from "./routes/health.js";
-
+import ingestRoutes from "./routes/ingest";
+import healthRoutes from "./routes/health";
+import metricsRoutes from "./routes/metrics"; // <-- add this
 
 const app = express();
-app.use(bodyParser.json({ limit: "5mb" }));
-app.use(health);
-app.use(ingest);
+const port = process.env.API_PORT || 4000;
 
+app.use(bodyParser.json());
 
-const port = Number(process.env.API_PORT ?? 8080);
+app.use("/ingest", ingestRoutes);
+app.use("/health", healthRoutes);
+app.use("/metrics", metricsRoutes); // <-- add this
 
-
-if (process.argv[2] === "migrate") {
-migrate().then(() => process.exit(0));
-} else {
-app.listen(port, () => console.log(`VerdantOps API running on :${port}`));
-}
+app.listen(port, () => {
+  console.log(`✅ API server running on port ${port}`);
+});
