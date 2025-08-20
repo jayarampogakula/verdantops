@@ -35,3 +35,14 @@ resource_sku text not null,
 kwh double precision not null,
 kg_co2e double precision not null
 );
+
+CREATE TABLE IF NOT EXISTS job_metrics (
+    id SERIAL PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    duration_ms BIGINT,
+    executor_cores INT,
+    executor_memory_gb INT,
+    energy_kwh DOUBLE PRECISION,
+    co2_kg DOUBLE PRECISION,
+    created_at TIMESTAMP DEFAULT NOW()
+);
