@@ -14,7 +14,7 @@ This MVP includes:
 
 ```bash
 # Clone repo
-git clone https://github.com/jayarampogakula/verdantops.git
+git clone https://github.com/learnbricksacademy/verdantops.git
 cd verdantops
 
 # Copy environment config
