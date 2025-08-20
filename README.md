@@ -1,5 +1,3 @@
-# verdantops
-
 # VerdantOps 🌱
 **Green DataOps Toolkit — Powered by Learnbricks Academy**
 
