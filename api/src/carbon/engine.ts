@@ -4,6 +4,10 @@ import { UsageIngestPayload } from '../types';
 const DEFAULT_INTENSITY =
   Number(process.env.CARBON_DEFAULT_GRID_INTENSITY_G_PER_KWH ?? 450);
 
+const RUN_BUDGET_KG = process.env.CARBON_BUDGET_KG_PER_RUN
+  ? Number(process.env.CARBON_BUDGET_KG_PER_RUN)
+  : undefined;
+
 export class CarbonEngine {
   constructor(private pool: Pool) {}
 
@@ -42,7 +46,23 @@ export class CarbonEngine {
     const kwh = nodeCount * hours * (watts / 1000) * util;
     return Number(kwh.toFixed(6));
   }
+  
+  private async getRunBudgetKg(source?: string, runId?: string): Promise<number | undefined> {
+    if (!source || !runId) return RUN_BUDGET_KG;
+    const q = `SELECT kg_co2e_budget FROM budgets WHERE source=$1 AND run_id=$2`;
+    const { rows } = await this.pool.query(q, [source, runId]);
+    if (rows[0]?.kg_co2e_budget != null) return Number(rows[0].kg_co2e_budget);
+    return RUN_BUDGET_KG;
+  }
 
+  // NEW: create alert row
+  private async createAlert(workloadId: number, severity: 'warning'|'critical', message: string, meta?: any) {
+    await this.pool.query(
+      `INSERT INTO alerts (workload_id, kind, severity, message, meta)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [workloadId, 'budget_breach', severity, message, meta ? JSON.stringify(meta) : null]
+    );
+  }
   async computeAndInsert(payload: UsageIngestPayload) {
     const intensityG = await this.getGridIntensityGPerKwh(payload.cloud, payload.regionCode);
     const estKWh = payload.estKWh ?? this.estimateKWhFallback(payload);
@@ -78,7 +98,18 @@ export class CarbonEngine {
     const { rows } = await this.pool.query(q, values);
     // refresh MV asynchronously
     this.pool.query('SELECT refresh_carbon_daily()').catch(()=>{});
-    return { id: rows[0].id, estKWh, estCo2eKg, intensityG };
+
+    const budget = await this.getRunBudgetKg(payload.source, payload.runId);
+    if (budget != null && estCo2eKg > budget) {
+      const severity = estCo2eKg > budget * 1.5 ? 'critical' : 'warning';
+      const overBy = Number((estCo2eKg - budget).toFixed(6));
+      await this.createAlert(workloadId, severity,
+        `Run exceeded CO₂e budget by ${overBy} kg (budget ${budget}, actual ${estCo2eKg})`,
+        { budgetKg: budget, actualKg: estCo2eKg, intensity_g_per_kWh: intensityG }
+      );
+    }
+    
+    return {  id: workloadId, estKWh, estCo2eKg, intensityG };
   }
 
   async summary(fromISO: string, toISO: string) {
