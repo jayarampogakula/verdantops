@@ -1,48 +1,117 @@
-// Minimal pluggable carbon/energy estimator.
-// E = t(h) * P_avg(kW) * U * PUE ; CO2e = E * CI
+import { Pool } from 'pg';
+import { UsageIngestPayload } from '../types';
 
+const DEFAULT_INTENSITY =
+  Number(process.env.CARBON_DEFAULT_GRID_INTENSITY_G_PER_KWH ?? 450);
 
-export type CarbonInputs = {
-region: string; // e.g., "eastus"
-resource_sku: string; // VM or GPU type
-duration_ms: number;
-utilization: number; // 0..1 (CPU or GPU dominant)
-};
+export class CarbonEngine {
+  constructor(private pool: Pool) {}
 
+  async getGridIntensityGPerKwh(cloud: string, regionCode: string): Promise<number> {
+    const q = `SELECT grid_intensity_g_per_kwh FROM regions WHERE cloud=$1 AND region_code=$2`;
+    const { rows } = await this.pool.query(q, [cloud, regionCode]);
+    if (rows[0]?.grid_intensity_g_per_kwh) return Number(rows[0].grid_intensity_g_per_kwh);
+    return DEFAULT_INTENSITY;
+  }
 
-// Simple maps. In production, load from DB/registry.
-const SKU_POWER_KW: Record<string, number> = {
-// Approximate average platform power per node under load.
-// CPU nodes
-"Standard_D8_v5": 0.20,
-"Standard_E8_v5": 0.24,
-// GPU nodes
-"Standard_NC4as_T4_v3": 0.35, // 1x T4
-"Standard_NC6s_v3": 0.60, // V100 approx
-};
+  /**
+   * Fallback energy estimate if collector doesn't send estKWh.
+   * Super-simple model:
+   *   kWh = nodeCount * hours * (watts_for_computeType / 1000) * utilization
+   * If computeType unknown, assume 150W per vCPU-equivalent ~ 1 core, 8-core default.
+   */
+  estimateKWhFallback(p: UsageIngestPayload): number {
+    const nodeCount = p.nodeCount ?? 1;
+    const util = Math.min(Math.max((p.avgCpuUtilization ?? 55) / 100, 0), 1);
+    const start = new Date(p.startedAt).getTime();
+    const end = new Date(p.endedAt).getTime();
+    const hours = Math.max((end - start) / 3_600_000, 0.01);
 
+    // crude watts lookup
+    const wattsLookup: Record<string, number> = {
+      // common Azure shapes (very rough ballparks)
+      'Standard_D8ds_v5': 180, 'Standard_D16ds_v5': 320,
+      // AWS
+      'm5.xlarge': 120, 'm5.2xlarge': 220,
+      // GCP
+      'n2-standard-8': 180, 'n2-standard-16': 320
+    };
+    const defaultWatts = 8 * 15; // 8 vCPU * 15W = 120W
+    const watts = wattsLookup[p.computeType ?? ''] ?? defaultWatts;
 
-const REGION_CI_KG_PER_KWH: Record<string, number> = {
-"eastus": 0.35,
-"westus2": 0.30,
-"westeurope": 0.20,
-"uksouth": 0.23
-};
+    const kwh = nodeCount * hours * (watts / 1000) * util;
+    return Number(kwh.toFixed(6));
+  }
 
+  async computeAndInsert(payload: UsageIngestPayload) {
+    const intensityG = await this.getGridIntensityGPerKwh(payload.cloud, payload.regionCode);
+    const estKWh = payload.estKWh ?? this.estimateKWhFallback(payload);
+    const estCo2eKg = Number(((estKWh * intensityG) / 1000).toFixed(6)); // g→kg
 
-const PROVIDER_PUE = 1.2; // v0 constant; make region/provider specific later.
+    const q = `
+      INSERT INTO workloads
+        (source, run_id, started_at, ended_at, cloud, region_code, compute_type, node_count,
+         avg_cpu_utilization, dbu, bytes_read, bytes_written, rows_processed, est_kwh, est_co2e_kg, raw)
+      VALUES
+        ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+      RETURNING id
+    `;
+    const values = [
+      payload.source,
+      payload.runId ?? null,
+      payload.startedAt,
+      payload.endedAt,
+      payload.cloud,
+      payload.regionCode,
+      payload.computeType ?? null,
+      payload.nodeCount ?? null,
+      payload.avgCpuUtilization ?? null,
+      payload.dbu ?? null,
+      payload.bytesRead ?? null,
+      payload.bytesWritten ?? null,
+      payload.rowsProcessed ?? null,
+      estKWh,
+      estCo2eKg,
+      JSON.stringify(payload)
+    ];
 
+    const { rows } = await this.pool.query(q, values);
+    // refresh MV asynchronously
+    this.pool.query('SELECT refresh_carbon_daily()').catch(()=>{});
+    return { id: rows[0].id, estKWh, estCo2eKg, intensityG };
+  }
 
-export function estimateEnergyKWh(inp: CarbonInputs, nodes = 1): number {
-const P = SKU_POWER_KW[inp.resource_sku] ?? 0.20; // fallback
-const t = Math.max(inp.duration_ms, 1) / 3_600_000; // ms -> hours
-const U = Math.min(Math.max(inp.utilization, 0.05), 1);
-return t * P * U * PROVIDER_PUE * nodes;
-}
+  async summary(fromISO: string, toISO: string) {
+    const qTotals = `
+      SELECT COALESCE(SUM(est_kwh),0) kwh,
+             COALESCE(SUM(est_co2e_kg),0) co2e_kg,
+             COALESCE(SUM(bytes_read + bytes_written),0) bytes_io
+      FROM workloads WHERE started_at >= $1 AND started_at < $2
+    `;
+    const qDaily = `
+      SELECT to_char(day,'YYYY-MM-DD') AS day, kwh, co2e_kg, bytes_io
+      FROM carbon_daily WHERE day >= $1 AND day < $2
+      ORDER BY day
+    `;
+    const [totals, daily] = await Promise.all([
+      this.pool.query(qTotals, [fromISO, toISO]),
+      this.pool.query(qDaily,  [fromISO, toISO])
+    ]);
 
-
-export function estimateCO2eKg(inp: CarbonInputs, nodes = 1): number {
-const E = estimateEnergyKWh(inp, nodes);
-const CI = REGION_CI_KG_PER_KWH[inp.region] ?? 0.35;
-return E * CI;
+    return {
+      from: fromISO,
+      to: toISO,
+      totals: {
+        kwh: Number(totals.rows[0].kwh ?? 0),
+        co2eKg: Number(totals.rows[0].co2e_kg ?? 0),
+        bytesIO: Number(totals.rows[0].bytes_io ?? 0)
+      },
+      byDay: daily.rows.map((r: any)=>({
+        day: r.day,
+        kwh: Number(r.kwh),
+        co2eKg: Number(r.co2e_kg),
+        bytesIO: Number(r.bytes_io)
+      }))
+    };
+  }
 }
