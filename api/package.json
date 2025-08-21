@@ -1,1 +1,9 @@
 docker-compose.yml
+{
+  "dependencies": {
+    "fastify": "^4.27.2",
+    "pg": "^8.12.0",
+    "zod": "^3.23.8"
+  }
+}
+
