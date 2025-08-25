@@ -1,18 +1,28 @@
-import express from "express";
-import bodyParser from "body-parser";
-import ingestRoutes from "./routes/ingest";
-import healthRoutes from "./routes/health";
-import metricsRoutes from "./routes/metrics"; // <-- add this
+import Fastify from 'fastify';
+import cors from '@fastify/cors'; 
+import healthRoutes from './routes/health';
+import ingestRoutes from './routes/ingest';
+import metricsRoutes from './routes/metrics';
+import greenRoutes from './routes/green';
+import { migrate } from './db';
 
-const app = express();
-const port = process.env.API_PORT || 4000;
+const app = Fastify({ logger: true });
 
-app.use(bodyParser.json());
+await app.register(cors, { origin: true });
 
-app.use("/ingest", ingestRoutes);
-app.use("/health", healthRoutes);
-app.use("/metrics", metricsRoutes); // <-- add this
+app.register(healthRoutes);
+app.register(ingestRoutes);
+app.register(metricsRoutes);
+app.register(greenRoutes);
 
-app.listen(port, () => {
-  console.log(`✅ API server running on port ${port}`);
-});
+const port = Number(process.env.PORT ?? 8080);
+
+(async () => {
+  try {
+    await migrate();
+    await app.listen({ port, host: '0.0.0.0' });
+  } catch (err) {
+    app.log.error(err);
+    process.exit(1);
+  }
+})();
